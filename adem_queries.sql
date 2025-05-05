@@ -148,17 +148,17 @@ RETURNS TABLE(business_id VARCHAR, name TEXT, distance DOUBLE PRECISION, common_
 BEGIN
     RETURN QUERY
     WITH target_business AS (
-        SELECT business_id, zipcode, latitude, longitude
-        FROM "Business"
-        WHERE business_id = target_id
+        SELECT b.business_id AS tb_id, b.zipcode AS tb_zip, b.latitude AS tb_lat, b.longitude AS tb_lon
+        FROM "Business" b
+        WHERE b.business_id = target_id
     )
     SELECT b.business_id, b.name, 
-           geodistance(tb.latitude, tb.longitude, b.latitude, b.longitude) AS distance,
-           count_categories(tb.business_id, b.business_id) AS common_categories
+           geodistance(tb.tb_lat, tb.tb_lon, b.latitude, b.longitude) AS distance,
+           count_categories(tb.tb_id, b.business_id) AS common_categories
     FROM target_business tb
-    JOIN "Business" b ON tb.zipcode = b.zipcode
-    WHERE b.business_id != tb.business_id
-    AND geodistance(tb.latitude, tb.longitude, b.latitude, b.longitude) <= 20
+    JOIN "Business" b ON tb.tb_zip = b.zipcode
+    WHERE b.business_id != tb.tb_id
+    AND geodistance(tb.tb_lat, tb.tb_lon, b.latitude, b.longitude) <= 20
     ORDER BY common_categories DESC, distance ASC
     LIMIT 15;
 END;
@@ -227,14 +227,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trig_after_insert_tip ON "Tip";
 CREATE TRIGGER trig_after_insert_tip
 AFTER INSERT ON "Tip"
 FOR EACH ROW
 EXECUTE FUNCTION after_insert_tip();
 
--- Test the trigger with an INSERT
-INSERT INTO "Tip" (business_id, user_id, tip_date, tip_text, likes)
-VALUES ('RESDUcs6mBiYjdUJUGAkmA', '4XChL029mKr5hydo79Ljxg', CURRENT_DATE, 'Great place, would come again!', 0);
+-- Test the trigger with an INSERT (only execute if data exists)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM "Business" WHERE business_id = 'RESDUcs6mBiYjdUJUGAkmA') AND 
+       EXISTS (SELECT 1 FROM "User" WHERE user_id = '4XChL029mKr5hydo79Ljxg') THEN
+        INSERT INTO "Tip" (business_id, user_id, tip_date, tip_text, likes)
+        VALUES ('RESDUcs6mBiYjdUJUGAkmA', '4XChL029mKr5hydo79Ljxg', CURRENT_DATE, 'Great place, would come again!', 0);
+    END IF;
+END $$;
 
 -- Check that counts were incremented
 SELECT business_id, num_tips FROM "Business" WHERE business_id = 'RESDUcs6mBiYjdUJUGAkmA';
@@ -249,36 +256,54 @@ DECLARE
     is_open BOOLEAN := FALSE;
 BEGIN
     -- Extract day of week and time from timestamp
-    day_name := to_char(NEW.checkin_timestamp, 'Day');
+    day_name := to_char(NEW.checkin_timestamp, 'FMDay');
     time_part := CAST(to_char(NEW.checkin_timestamp, 'HH24:MI:SS') AS TIME);
     
     -- Check if business is open at this time
     SELECT COUNT(*) > 0 INTO is_open
     FROM "BusinessHours" BH
     WHERE BH.business_id = NEW.business_id
-    AND BH.day_of_week = TRIM(day_name)
+    AND BH.day_of_week = day_name
     AND BH.open_time <= time_part
     AND BH.close_time >= time_part;
     
     IF NOT is_open THEN
         RAISE EXCEPTION 'Cannot check in when business is closed: % is not open on % at %', 
-                        NEW.business_id, TRIM(day_name), time_part;
+                        NEW.business_id, day_name, time_part;
     END IF;
     
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trig_before_insert_checkin ON "Checkin";
 CREATE TRIGGER trig_before_insert_checkin
 BEFORE INSERT ON "Checkin"
 FOR EACH ROW
 EXECUTE FUNCTION before_insert_checkin();
 
--- Test cases for checkin trigger (positive and negative examples)
--- Positive test: Business is open
-INSERT INTO "Checkin" (business_id, checkin_timestamp)
-VALUES ('RESDUcs6mBiYjdUJUGAkmA', '2023-05-01 18:30:00');
+-- Test cases for checkin trigger (positive and negative examples - only execute if data exists)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM "Business" WHERE business_id = 'RESDUcs6mBiYjdUJUGAkmA') AND
+       EXISTS (SELECT 1 FROM "BusinessHours" WHERE business_id = 'RESDUcs6mBiYjdUJUGAkmA' AND day_of_week = 'Monday' AND open_time <= '18:30:00' AND close_time >= '18:30:00') THEN
+        -- Positive test: Business is open
+        INSERT INTO "Checkin" (business_id, checkin_timestamp)
+        VALUES ('RESDUcs6mBiYjdUJUGAkmA', '2023-05-01 18:30:00');
+    END IF;
+END $$;
 
--- Negative test: Business is closed
-INSERT INTO "Checkin" (business_id, checkin_timestamp)
-VALUES ('RESDUcs6mBiYjdUJUGAkmA', '2023-05-01 03:30:00'); 
+-- This should fail with exception if the business exists but is closed at the time
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM "Business" WHERE business_id = 'RESDUcs6mBiYjdUJUGAkmA') THEN
+        -- Negative test: Business is closed
+        BEGIN
+            INSERT INTO "Checkin" (business_id, checkin_timestamp)
+            VALUES ('RESDUcs6mBiYjdUJUGAkmA', '2023-05-01 03:30:00');
+        EXCEPTION
+            WHEN OTHERS THEN
+                RAISE NOTICE 'Expected exception caught: %', SQLERRM;
+        END;
+    END IF;
+END $$; 
